@@ -100,7 +100,7 @@ status                 connection, time, and weather status
 set units metric       metric or imperial
 set weather_minutes 15 automatic weather refresh interval (5..180)
 display test            show a test page briefly, then restore the dashboard
-refresh test            run all six 0..9 partial-refresh experiments
+refresh test            enter bench mode and run configured test (same as rt)
 refresh test 1          rerun stage 1 (1..6) and leave digit 9 displayed
 rt                      run the configurable refresh test
 rt show                 show its current parameters
@@ -112,6 +112,13 @@ rt set cycles forever   sequence cycles, or a finite number
 rt set glyphs digits    digits or all printable ASCII glyphs
 rt set full_every 20    full cleanup every N draws, or off
 rt save                 persist the refresh-test parameters
+rt all                  run all six presets with responsive controls
+stop                    pause test, keeping the bench image visible
+run                     resume, or restart a completed sequence
+clock                   return to the clock demo
+refresh                 fully redraw the current mode/image
+rt set full_mode fast   fast (GxEPD2 default) or normal full waveform
+rt set prime old        post-full RAM seeding: old, both, or none
 erase                    erase saved settings after confirmation
 reboot                   restart the ESP32
 ```
@@ -120,6 +127,74 @@ Commands and detailed validation errors appear only on serial. After Wi-Fi is
 configured, the firmware reconnects automatically, synchronizes time with NTP,
 fetches current conditions from Open-Meteo, and refreshes the clock once per
 minute. Weather is refreshed every 15 minutes by default.
+
+Bench mode suppresses clock, time-sync, and weather-triggered display updates,
+including after a finite test finishes. Automatic weather fetching is deferred
+until clock mode resumes. Serial commands run between individual panel updates;
+`stop` responds after the current waveform completes, without waiting for the
+configured inter-draw delay. Settings persist only when saved.
+
+The full-to-partial transition now follows the local GxEPD2 driver: write both
+planes through an explicit RAM window, trigger FastFull outside partial mode,
+reset panel settings (handled by epdsi), then prime the old plane. The previous
+Rust sequence used normal Full and omitted that reset. To isolate the remaining
+physical symptom, use `rt set full_every 10` and compare `full_mode fast` versus
+`normal`, keeping `mode fast` and `sync on`; compare `prime old` versus `both`
+separately. Logs include actual waveform duration. These are diagnostic controls;
+the full-to-partial fix has now been visually confirmed by the user.
+
+## Advanced Rust refresh bench
+
+`rt set` opens a numbered settings menu and pauses an active bench. Enter a
+setting number, then its value when prompted. It returns to the setting list
+after each successful edit. `0` at the list or `cancel` exits; zero remains a
+valid setting value. `run` resumes; `rt save` persists settings. Direct
+`rt set <key> <value>` commands still work.
+
+Regions use logical landscape coordinates: **416 wide by 240 high**, origin at
+top left. `region preset` retains the original two tiles. `rect x y w h` sets
+all four fields atomically and selects `custom`; `region sweep` scans a 5x3
+grid including edges and center, while `region random` uses repeatable
+pseudorandom positions with the configured width/height. Moving tests leave
+previous tiles in place deliberately, exposing corruption outside the window.
+Non-preset baselines include reference grid marks.
+
+Content choices are `digits`, `all` (94 printable ASCII glyphs), `shapes`
+(filled/outlined rectangle, circle, triangle and diagonal), `shades`
+(17 black-coverage levels using 4x4 ordered dithering), and `mixed` (interleaves
+the four types). `size large|small` selects glyph scale, independent of custom
+region dimensions; glyphs are clipped rather than resized to fit. The panel
+is monochrome: shades are spatial dithering, not native grayscale.
+
+Example: test unaligned, moving 160x120 patches without periodic cleanup:
+
+```text
+rt set rect 13 7 160 120
+rt set region random
+rt set content mixed
+rt set size large
+rt set mode fast
+rt set sync on
+rt set cycles forever
+rt set time 1
+rt set full_every off
+rt
+```
+
+For a full-screen fast-partial stress test use `rt set rect 0 0 416 240`.
+To test small text use `rt set content all` and `rt set size small`.
+Each draw logs content/index, requested rectangle, actual byte-aligned native
+window, pixel count, percentage of panel area, and waveform duration. Expanded
+edge pixels are copied from the framebuffer unchanged. Repeat at different
+sizes and gaps, watching for ghosting, missed transitions, or changes outside
+the window; the firmware does not automatically declare a region safe.
+
+Geometry checks can run on the host without ESP-IDF:
+
+```sh
+rustc +stable --test src/bench_geometry.rs -o target/bench-geometry-tests.exe
+target/bench-geometry-tests.exe
+```
 
 ## Notes
 

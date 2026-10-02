@@ -8,12 +8,14 @@ use embedded_graphics::{
     },
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::{Circle, Line, PrimitiveStyle, Rectangle, Triangle},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 
 use crate::{
-    config::Settings,
+    config::{
+        RefreshTestGlyphs, RefreshTestRegion, RefreshTestSettings, RefreshTestSize, Settings,
+    },
     weather::{description, Weather},
 };
 
@@ -197,6 +199,136 @@ impl LandscapeFrame {
         }
     }
 
+    pub fn render_bench_base(&mut self, config: &RefreshTestSettings) {
+        if config.region == RefreshTestRegion::Preset {
+            self.render_refresh_test_base();
+            return;
+        }
+        self.clear(BinaryColor::Off).ok();
+        // Reference grid makes unintended changes outside the selected window visible.
+        for x in (0..416).step_by(32) {
+            for y in (0..240).step_by(32) {
+                Line::new(Point::new(x, y), Point::new(x + 5, y))
+                    .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+                    .draw(self)
+                    .ok();
+            }
+        }
+    }
+
+    pub fn render_bench_patch(&mut self, config: &RefreshTestSettings, item: u16, rect: Rectangle) {
+        let kind = if config.glyphs == RefreshTestGlyphs::Mixed {
+            match item % 4 {
+                0 => RefreshTestGlyphs::Digits,
+                1 => RefreshTestGlyphs::All,
+                2 => RefreshTestGlyphs::Shapes,
+                _ => RefreshTestGlyphs::Shades,
+            }
+        } else {
+            config.glyphs
+        };
+        let item = if config.glyphs == RefreshTestGlyphs::Mixed {
+            item / 4
+        } else {
+            item
+        };
+        let large = config.size == RefreshTestSize::Large;
+        if kind == RefreshTestGlyphs::All {
+            rect.into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+                .draw(self)
+                .ok();
+            let scale = if large { 7 } else { 1 };
+            let mut scaled = ScaledDrawTarget {
+                target: self,
+                origin: rect.center() - Point::new(5 * scale, 10 * scale),
+                scale,
+                clip: rect,
+            };
+            let encoded = [33 + (item % 94) as u8];
+            let glyph = core::str::from_utf8(&encoded).unwrap();
+            Text::with_baseline(
+                glyph,
+                Point::zero(),
+                MonoTextStyle::new(&FONT_10X20, BinaryColor::On),
+                Baseline::Top,
+            )
+            .draw(&mut scaled)
+            .ok();
+            return;
+        }
+        let mut target = self.clipped(&rect);
+        rect.into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+            .draw(&mut target)
+            .ok();
+        match kind {
+            RefreshTestGlyphs::Digits => {
+                let (w, h, t) = if large { (100, 160, 14) } else { (20, 32, 3) };
+                draw_digit(
+                    &mut target,
+                    (item % 10) as u8,
+                    rect.center() - Point::new(w as i32 / 2, h as i32 / 2),
+                    w,
+                    h,
+                    t,
+                );
+            }
+            RefreshTestGlyphs::Shapes => {
+                let style = if item % 2 == 0 {
+                    PrimitiveStyle::with_fill(BinaryColor::On)
+                } else {
+                    PrimitiveStyle::with_stroke(BinaryColor::On, 3)
+                };
+                let p = rect.top_left;
+                let end = p + Point::new(rect.size.width as i32 - 1, rect.size.height as i32 - 1);
+                match item % 6 {
+                    0 | 1 => {
+                        rect.into_styled(style).draw(&mut target).ok();
+                    }
+                    2 | 3 => {
+                        let d = rect.size.width.min(rect.size.height);
+                        Circle::new(rect.center() - Point::new(d as i32 / 2, d as i32 / 2), d)
+                            .into_styled(style)
+                            .draw(&mut target)
+                            .ok();
+                    }
+                    _ => {
+                        Triangle::new(
+                            p,
+                            Point::new(end.x, p.y),
+                            Point::new(rect.center().x, end.y),
+                        )
+                        .into_styled(style)
+                        .draw(&mut target)
+                        .ok();
+                        Line::new(p, end)
+                            .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+                            .draw(&mut target)
+                            .ok();
+                    }
+                }
+            }
+            RefreshTestGlyphs::Shades => {
+                const BAYER: [[u16; 4]; 4] =
+                    [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+                // 0..100% black coverage, then back to white on the next cycle.
+                let level = item % 17;
+                target
+                    .draw_iter(rect.points().map(|p| {
+                        Pixel(
+                            p,
+                            if BAYER[p.y as usize % 4][p.x as usize % 4] < level {
+                                BinaryColor::On
+                            } else {
+                                BinaryColor::Off
+                            },
+                        )
+                    }))
+                    .ok();
+            }
+            _ => {}
+        }
+    }
+
     pub fn render_refresh_test_patch(&mut self, digit: u8, left: bool) {
         let rectangle = refresh_test_rectangle(left);
         clear_test_patch(self, rectangle);
@@ -226,6 +358,7 @@ impl LandscapeFrame {
             target: self,
             origin,
             scale,
+            clip: rectangle,
         };
         let style = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
         let mut encoded = [0_u8; 4];
@@ -240,6 +373,7 @@ struct ScaledDrawTarget<'a> {
     target: &'a mut LandscapeFrame,
     origin: Point,
     scale: i32,
+    clip: Rectangle,
 }
 
 impl OriginDimensions for ScaledDrawTarget<'_> {
@@ -259,13 +393,14 @@ impl DrawTarget for ScaledDrawTarget<'_> {
         for Pixel(point, color) in pixels {
             for y in 0..self.scale {
                 for x in 0..self.scale {
-                    self.target.draw_iter(core::iter::once(Pixel(
-                        Point::new(
-                            self.origin.x + point.x * self.scale + x,
-                            self.origin.y + point.y * self.scale + y,
-                        ),
-                        color,
-                    )))?;
+                    let position = Point::new(
+                        self.origin.x + point.x * self.scale + x,
+                        self.origin.y + point.y * self.scale + y,
+                    );
+                    if self.clip.contains(position) {
+                        self.target
+                            .draw_iter(core::iter::once(Pixel(position, color)))?;
+                    }
                 }
             }
         }
@@ -282,13 +417,14 @@ fn refresh_test_rectangle(left: bool) -> Rectangle {
 }
 
 fn clear_test_patch(target: &mut LandscapeFrame, rectangle: Rectangle) {
+    let mut target = target.clipped(&rectangle);
     rectangle
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-        .draw(target)
+        .draw(&mut target)
         .ok();
     rectangle
         .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 3))
-        .draw(target)
+        .draw(&mut target)
         .ok();
 }
 
@@ -343,8 +479,8 @@ fn draw_number(
     }
 }
 
-fn draw_digit(
-    target: &mut LandscapeFrame,
+fn draw_digit<T: DrawTarget<Color = BinaryColor>>(
+    target: &mut T,
     digit: u8,
     origin: Point,
     width: u32,

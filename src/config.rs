@@ -37,6 +37,26 @@ pub enum RefreshTestMode {
 pub enum RefreshTestGlyphs {
     Digits,
     All,
+    Shapes,
+    Shades,
+    Mixed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RefreshTestRegion {
+    Preset,
+    Custom,
+    Sweep,
+    Random,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RefreshTestPrime {
+    Old,
+    Both,
+    None,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,12 +65,19 @@ pub struct RefreshTestSettings {
     pub time_seconds: u16,
     pub size: RefreshTestSize,
     pub mode: RefreshTestMode,
+    pub full_mode: RefreshTestMode,
+    pub prime: RefreshTestPrime,
     pub sync_baseline: bool,
     /// Number of complete glyph-sequence cycles; zero means forever.
     pub cycles: u32,
     /// Perform a full refresh after this many draws; zero disables it.
     pub full_every: u16,
     pub glyphs: RefreshTestGlyphs,
+    pub region: RefreshTestRegion,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
 }
 
 impl Default for RefreshTestSettings {
@@ -59,10 +86,17 @@ impl Default for RefreshTestSettings {
             time_seconds: 1,
             size: RefreshTestSize::Large,
             mode: RefreshTestMode::Fast,
+            full_mode: RefreshTestMode::Fast,
+            prime: RefreshTestPrime::Old,
             sync_baseline: true,
             cycles: 1,
             full_every: 0,
             glyphs: RefreshTestGlyphs::Digits,
+            region: RefreshTestRegion::Preset,
+            x: 8,
+            y: 24,
+            width: 192,
+            height: 200,
         }
     }
 }
@@ -96,7 +130,7 @@ impl ConfigStore {
     }
 
     pub fn load(&self) -> Result<Settings> {
-        let mut buffer = [0_u8; 1024];
+        let mut buffer = [0_u8; 2048];
         let Some(bytes) = self.storage.get_raw(CONFIG_KEY, &mut buffer)? else {
             return Ok(Settings::default());
         };
@@ -105,7 +139,7 @@ impl ConfigStore {
 
     pub fn save(&self, settings: &Settings) -> Result<()> {
         let bytes = serde_json::to_vec(settings)?;
-        anyhow::ensure!(bytes.len() <= 1024, "configuration is too large");
+        anyhow::ensure!(bytes.len() <= 2048, "configuration is too large");
         self.storage.set_raw(CONFIG_KEY, &bytes)?;
         Ok(())
     }
