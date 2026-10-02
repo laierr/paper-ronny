@@ -21,6 +21,14 @@ use crate::{
 
 pub const FRAME_BYTES: usize = 240 * 416 / 8;
 
+pub fn text_cell_size(size: RefreshTestSize) -> (u32, u32) {
+    if size == RefreshTestSize::Large {
+        (10, 20)
+    } else {
+        (6, 10)
+    }
+}
+
 pub struct LandscapeFrame {
     bytes: Box<[u8; FRAME_BYTES]>,
 }
@@ -58,45 +66,66 @@ impl LandscapeFrame {
 
     pub fn render(&mut self, settings: &Settings, weather: &Weather, now: Option<NaiveDateTime>) {
         self.clear(BinaryColor::Off).ok();
-
-        let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
         let medium = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
+        let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
         let centered = TextStyleBuilder::new()
             .alignment(Alignment::Center)
             .baseline(Baseline::Top)
             .build();
         let left = TextStyleBuilder::new().baseline(Baseline::Top).build();
-
         if let Some(now) = now {
             draw_time(self, &now.format("%H:%M").to_string());
             Text::with_text_style(
-                &now.format("%A  %d %B %Y").to_string(),
-                Point::new(208, 111),
+                &now.format("%A, %d %B").to_string(),
+                Point::new(208, 132),
                 medium,
                 centered,
             )
             .draw(self)
             .ok();
         } else {
-            Text::with_text_style("SYNCING TIME", Point::new(208, 43), medium, centered)
+            Text::with_text_style("SYNCING TIME", Point::new(208, 58), medium, centered)
                 .draw(self)
                 .ok();
-            Text::with_text_style("Waiting for NTP", Point::new(208, 79), small, centered)
+            Text::with_text_style("Waiting for NTP", Point::new(208, 90), small, centered)
                 .draw(self)
                 .ok();
         }
-        Rectangle::new(Point::new(16, 140), Size::new(384, 2))
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        Line::new(Point::new(16, 160), Point::new(399, 160))
+            .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
             .draw(self)
             .ok();
-
         if weather.valid {
+            let icon: &[u8; 512] = match weather.code {
+                0 if !weather.is_day => include_bytes!("../assets/weather-icons/moon.bin"),
+                0 => include_bytes!("../assets/weather-icons/sun.bin"),
+                1 | 2 => include_bytes!("../assets/weather-icons/partly.bin"),
+                3 => include_bytes!("../assets/weather-icons/cloud.bin"),
+                45 | 48 => include_bytes!("../assets/weather-icons/fog.bin"),
+                51..=67 | 80..=82 => include_bytes!("../assets/weather-icons/rain.bin"),
+                71..=77 | 85 | 86 => include_bytes!("../assets/weather-icons/snow.bin"),
+                95..=99 => include_bytes!("../assets/weather-icons/storm.bin"),
+                _ => include_bytes!("../assets/weather-icons/cloud.bin"),
+            };
+            self.draw_iter((0..64).flat_map(|y| {
+                (0..64).map(move |x| {
+                    Pixel(
+                        Point::new(16 + x, 169 + y),
+                        if icon[(y * 8 + x / 8) as usize] & (1 << (7 - x % 8)) == 0 {
+                            BinaryColor::On
+                        } else {
+                            BinaryColor::Off
+                        },
+                    )
+                })
+            }))
+            .ok();
             let unit = if settings.metric { "C" } else { "F" };
             let temperature = format!("{:.0}", weather.temperature);
-            draw_number(self, &temperature, Point::new(18, 153), 28, 48, 5, 7);
+            draw_number(self, &temperature, Point::new(90, 175), 26, 44, 5, 5);
             Text::with_text_style(
                 unit,
-                Point::new(18 + temperature.len() as i32 * 35, 174),
+                Point::new(90 + temperature.len() as i32 * 31, 197),
                 medium,
                 left,
             )
@@ -104,27 +133,31 @@ impl LandscapeFrame {
             .ok();
             Text::with_text_style(
                 description(weather.code),
-                Point::new(142, 153),
+                Point::new(205, 173),
                 medium,
                 left,
             )
             .draw(self)
             .ok();
             Text::with_text_style(
-                &format!("Feels {:.0} {}", weather.apparent, unit),
-                Point::new(144, 181),
+                &format!(
+                    "Feels {:.0} {}  RH {:.0}%",
+                    weather.apparent, unit, weather.humidity
+                ),
+                Point::new(205, 200),
                 small,
                 left,
             )
             .draw(self)
             .ok();
-            let speed = if settings.metric { "km/h" } else { "mph" };
             Text::with_text_style(
                 &format!(
-                    "Humidity {:.0}%    Wind {:.0} {}",
-                    weather.humidity, weather.wind, speed
+                    "Wind {:.0} {}{}",
+                    weather.wind,
+                    if settings.metric { "km/h" } else { "mph" },
+                    if weather.stale { " (stale)" } else { "" }
                 ),
-                Point::new(144, 207),
+                Point::new(205, 218),
                 small,
                 left,
             )
@@ -133,7 +166,7 @@ impl LandscapeFrame {
         } else {
             Text::with_text_style(
                 "Weather unavailable",
-                Point::new(208, 174),
+                Point::new(208, 190),
                 medium,
                 centered,
             )
@@ -200,6 +233,21 @@ impl LandscapeFrame {
     }
 
     pub fn render_bench_base(&mut self, config: &RefreshTestSettings) {
+        if config.region == RefreshTestRegion::TextPage {
+            self.render_text_page(config.size);
+            return;
+        }
+        if config.region == RefreshTestRegion::Patterns {
+            self.clear(BinaryColor::Off).ok();
+            return;
+        }
+        if config.region == RefreshTestRegion::Grid {
+            self.clear(BinaryColor::Off).ok();
+            for cell in 0..crate::bench_geometry::GRID_CELLS.len() {
+                self.render_grid_cell(config, cell, 0);
+            }
+            return;
+        }
         if config.region == RefreshTestRegion::Preset {
             self.render_refresh_test_base();
             return;
@@ -261,6 +309,38 @@ impl LandscapeFrame {
             .draw(&mut target)
             .ok();
         match kind {
+            RefreshTestGlyphs::Text => {
+                let message = match item % 8 {
+                    0 => "Paper Ronny",
+                    1 => "WiFi connected",
+                    2 => "0123456789",
+                    3 => "The quick brown fox",
+                    4 => "BLACK -> WHITE",
+                    5 => "thin strokes / dots",
+                    6 => "Time 12:34:56",
+                    _ => "Weather 27 C",
+                };
+                let style = if large {
+                    MonoTextStyle::new(&FONT_10X20, BinaryColor::On)
+                } else {
+                    MonoTextStyle::new(&FONT_6X10, BinaryColor::On)
+                };
+                let centered = TextStyleBuilder::new()
+                    .alignment(Alignment::Center)
+                    .baseline(Baseline::Top)
+                    .build();
+                Text::with_text_style(
+                    message,
+                    Point::new(
+                        rect.center().x,
+                        rect.center().y - if large { 10 } else { 5 },
+                    ),
+                    style,
+                    centered,
+                )
+                .draw(&mut target)
+                .ok();
+            }
             RefreshTestGlyphs::Digits => {
                 let (w, h, t) = if large { (100, 160, 14) } else { (20, 32, 3) };
                 draw_digit(
@@ -327,6 +407,115 @@ impl LandscapeFrame {
             }
             _ => {}
         }
+    }
+
+    pub fn render_text_page(&mut self, size: RefreshTestSize) {
+        self.clear(BinaryColor::Off).ok();
+        let (cw, ch) = text_cell_size(size);
+        const SAMPLE: &[u8] = b"Paper Ronny 0123456789 The quick brown fox jumps over the lazy dog. WiFi weather clock / ABC xyz!? ";
+        for row in 0..240 / ch {
+            let line: String = (0..416 / cw)
+                .map(|column| SAMPLE[((row * 13 + column) as usize) % SAMPLE.len()] as char)
+                .collect();
+            self.replace_text_cells(
+                size,
+                &line,
+                Rectangle::new(
+                    Point::new(0, (row * ch) as i32),
+                    Size::new((416 / cw) * cw, ch),
+                ),
+            );
+        }
+    }
+
+    pub fn render_text_patch(&mut self, size: RefreshTestSize, draw: u32, rect: Rectangle) {
+        let (cw, _) = text_cell_size(size);
+        let replacement: String = (0..rect.size.width / cw)
+            .map(|i| (33 + ((draw + i) % 94) as u8) as char)
+            .collect();
+        self.replace_text_cells(size, &replacement, rect);
+    }
+
+    fn replace_text_cells(&mut self, size: RefreshTestSize, text: &str, rect: Rectangle) {
+        let mut target = self.clipped(&rect);
+        rect.into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+            .draw(&mut target)
+            .ok();
+        let font = if size == RefreshTestSize::Large {
+            &FONT_10X20
+        } else {
+            &FONT_6X10
+        };
+        Text::with_baseline(
+            text,
+            rect.top_left,
+            MonoTextStyle::new(font, BinaryColor::On),
+            Baseline::Top,
+        )
+        .draw(&mut target)
+        .ok();
+    }
+
+    pub fn render_pattern(&mut self, pattern: crate::bench_geometry::Pattern) {
+        use crate::bench_geometry::Pattern;
+        // Generate targets from absolute coordinates: a repeated invert stage
+        // must repeat its target, not accidentally invert the framebuffer again.
+        self.draw_iter((0..240).flat_map(|y| {
+            (0..416).map(move |x| {
+                let grid = x % 16 == 0 || y % 16 == 0;
+                let black = match pattern {
+                    Pattern::Vertical => x % 16 == 0,
+                    Pattern::Horizontal => y % 16 == 0,
+                    Pattern::Grid => grid,
+                    Pattern::WhiteGrid => !grid,
+                    Pattern::Black => true,
+                    Pattern::White => false,
+                    Pattern::Dither => (x + y) % 2 == 0,
+                    Pattern::Sparse => {
+                        (x - 208) * (x - 208) + (y - 120) * (y - 120) < 45 * 45
+                            || x == y
+                            || x == 415 - y
+                    }
+                };
+                Pixel(
+                    Point::new(x, y),
+                    if black {
+                        BinaryColor::On
+                    } else {
+                        BinaryColor::Off
+                    },
+                )
+            })
+        }))
+        .ok();
+    }
+
+    pub fn render_grid_cell(&mut self, config: &RefreshTestSettings, cell: usize, step: u16) {
+        let (x, y, w, h) = crate::bench_geometry::GRID_CELLS[cell];
+        let rect = Rectangle::new(Point::new(x as i32, y as i32), Size::new(w, h));
+        let mut tile = config.clone();
+        tile.size = if cell == 4 {
+            RefreshTestSize::Small
+        } else {
+            RefreshTestSize::Large
+        };
+        tile.glyphs = match cell {
+            0 => RefreshTestGlyphs::Digits,
+            1 | 4 => RefreshTestGlyphs::Text,
+            2 => RefreshTestGlyphs::Shapes,
+            3 => RefreshTestGlyphs::Shades,
+            // Stress black -> sparse text -> white -> sparse text transitions.
+            _ if step % 4 == 0 || step % 4 == 2 => RefreshTestGlyphs::Shades,
+            _ => RefreshTestGlyphs::Text,
+        };
+        let item = if cell == 5 && step % 4 == 0 {
+            16
+        } else if cell == 5 && step % 4 == 2 {
+            0
+        } else {
+            step
+        };
+        self.render_bench_patch(&tile, item, rect);
     }
 
     pub fn render_refresh_test_patch(&mut self, digit: u8, left: bool) {
@@ -429,19 +618,19 @@ fn clear_test_patch(target: &mut LandscapeFrame, rectangle: Rectangle) {
 }
 
 fn draw_time(target: &mut LandscapeFrame, time: &str) {
-    let mut x = 67;
+    let mut x = 26;
     for character in time.chars() {
         if character == ':' {
-            for y in [34, 70] {
-                Rectangle::new(Point::new(x + 5, y), Size::new(10, 10))
+            for y in [46, 94] {
+                Rectangle::new(Point::new(x + 6, y), Size::new(12, 12))
                     .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
                     .draw(target)
                     .ok();
             }
-            x += 26;
+            x += 30;
         } else if let Some(digit) = character.to_digit(10) {
-            draw_digit(target, digit as u8, Point::new(x, 10), 56, 90, 8);
-            x += 66;
+            draw_digit(target, digit as u8, Point::new(x, 14), 76, 112, 10);
+            x += 84;
         }
     }
 }

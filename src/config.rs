@@ -40,6 +40,7 @@ pub enum RefreshTestGlyphs {
     Shapes,
     Shades,
     Mixed,
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +50,16 @@ pub enum RefreshTestRegion {
     Custom,
     Sweep,
     Random,
+    Grid,
+    TextPage,
+    Patterns,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GridUpdate {
+    Cell,
+    Screen,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +89,11 @@ pub struct RefreshTestSettings {
     pub y: u16,
     pub width: u16,
     pub height: u16,
+    pub grid_update: GridUpdate,
+    pub text_chars: u16,
+    pub blank_before: bool,
+    pub scrub_before: bool,
+    pub post_full_fast: bool,
 }
 
 impl Default for RefreshTestSettings {
@@ -97,6 +113,11 @@ impl Default for RefreshTestSettings {
             y: 24,
             width: 192,
             height: 200,
+            grid_update: GridUpdate::Cell,
+            text_chars: 8,
+            blank_before: false,
+            scrub_before: false,
+            post_full_fast: true,
         }
     }
 }

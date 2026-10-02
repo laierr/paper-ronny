@@ -1,4 +1,5 @@
 mod bench_geometry;
+mod clock_policy;
 mod config;
 mod display;
 mod weather;
@@ -13,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use embedded_graphics::{prelude::*, primitives::Rectangle};
 use embedded_hal::spi::MODE_0;
 use embedded_svc::wifi::{AuthMethod, ClientConfiguration, Configuration};
@@ -31,23 +32,18 @@ use esp_idf_svc::{
     io::vfs::BlockingStdIo,
     log::EspLogger,
     nvs::EspDefaultNvsPartition,
-    sntp::{EspSntp, SyncStatus},
+    sntp::EspSntp,
     sys,
     wifi::{BlockingWifi, EspWifi},
 };
 
 use config::{
-    ConfigStore, RefreshTestGlyphs, RefreshTestMode, RefreshTestPrime, RefreshTestRegion,
-    RefreshTestSettings, RefreshTestSize, Settings,
+    ConfigStore, GridUpdate, RefreshTestGlyphs, RefreshTestMode, RefreshTestPrime,
+    RefreshTestRegion, RefreshTestSettings, RefreshTestSize, Settings,
 };
 use display::LandscapeFrame;
 use weather::Weather;
 
-const FULL_REFRESH_AFTER: u16 = 10;
-const CLOCK_WINDOW_X_START: u32 = 128;
-const CLOCK_WINDOW_X_END: u32 = 239;
-const CLOCK_WINDOW_Y_START: u32 = 0;
-const CLOCK_WINDOW_Y_END: u32 = 415;
 const SNTP_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 enum AppMode {
@@ -133,14 +129,20 @@ fn main() -> Result<()> {
     let mut sntp: Option<EspSntp<'static>> = None;
     let mut weather = Weather::default();
     let mut frame = LandscapeFrame::new();
-    let mut partial_refreshes = 0_u16;
-    let mut last_minute = 255_u32;
-    let mut last_ordinal = 0_u32;
+    let mut clock_dirty = true;
+    let mut clock_minute: Option<i64> = None;
+    let mut hourly_cleanup = clock_policy::HourlyCleanup::default();
+    let mut last_wifi_attempt = Instant::now() - Duration::from_secs(60);
     let mut last_weather_attempt = Instant::now() - Duration::from_secs(3600);
     let mut last_sntp_restart = Instant::now();
     let mut clock_was_valid = valid_local_now().is_some();
     let mut app_mode = AppMode::Clock;
     let mut rt_menu: Option<usize> = None;
+    let boot_time = Instant::now();
+    let mut clock_patches = 0_u64;
+    let mut hourly_whites = 0_u64;
+    let mut six_hour_scrubs = 0_u64;
+    let mut last_cleanup = String::from("none since boot");
 
     push_full_display(&mut epd, &mut delay, &mut frame, &settings, &weather)?;
     if !settings.ssid.is_empty() && connect_wifi(&mut wifi, &settings).is_ok() {
@@ -176,6 +178,8 @@ fn main() -> Result<()> {
                         | "rt stop"
                         | "clock"
                         | "refresh"
+                        | "refresh fast"
+                        | "refresh scrub"
                         | "rt save"
                         | "rt show"
                         | "help"
@@ -215,6 +219,15 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            clock_dirty = true;
+            if matches!(
+                line.trim().to_ascii_lowercase().as_str(),
+                "status" | "clock stats"
+            ) {
+                println!("Clock soak: uptime={}s, patches={}, hourly_white={}, six_hour_scrubs={}, last_cleanup={}, free_heap={}B",
+                    boot_time.elapsed().as_secs(),clock_patches,hourly_whites,six_hour_scrubs,last_cleanup,
+                    unsafe { sys::esp_get_free_heap_size() });
+            }
             match handle_command(
                 &line,
                 &mut settings,
@@ -223,37 +236,49 @@ fn main() -> Result<()> {
                 &mut sntp,
                 &mut weather,
             ) {
-                Ok(CommandResult::Refresh) => {
-                    match &mut app_mode {
-                        AppMode::Clock => push_full_display(
-                            &mut epd, &mut delay, &mut frame, &settings, &weather,
-                        )?,
-                        AppMode::Bench(state) => {
-                            refresh_test_full_frame(
-                                &mut epd,
-                                &mut delay,
-                                &frame,
-                                &settings.refresh_test,
-                            )?;
-                            state.next_draw = Instant::now();
-                            println!("Bench frame fully refreshed; mode and run state preserved.");
-                        }
+                Ok(CommandResult::RefreshFast) => {
+                    fast_blank_redraw(&mut epd, &mut delay, &frame)?;
+                    if let AppMode::Bench(state) = &mut app_mode {
+                        state.next_draw = Instant::now()
+                            + Duration::from_secs(settings.refresh_test.time_seconds as u64);
                     }
-                    partial_refreshes = 0;
-                    if let Some(now) = valid_local_now() {
-                        last_minute = now.minute();
-                        last_ordinal = now.ordinal();
-                    }
+                    println!("Experimental fast blank/redraw complete; framebuffer, mode and run state preserved.");
                 }
+                Ok(CommandResult::RefreshScrub) => {
+                    fast_blank_then_display(
+                        &mut epd,
+                        &mut delay,
+                        frame.bytes(),
+                        frame.bytes(),
+                        true,
+                    )?;
+                    if let AppMode::Bench(state) = &mut app_mode {
+                        state.next_draw = Instant::now()
+                            + Duration::from_secs(settings.refresh_test.time_seconds as u64);
+                    }
+                    println!(
+                        "Fast white/black/white cleanup + restore complete; run state preserved."
+                    );
+                }
+                Ok(CommandResult::Refresh) => match &mut app_mode {
+                    AppMode::Clock => {
+                        push_full_display(&mut epd, &mut delay, &mut frame, &settings, &weather)?
+                    }
+                    AppMode::Bench(state) => {
+                        refresh_test_full_frame(
+                            &mut epd,
+                            &mut delay,
+                            &frame,
+                            &settings.refresh_test,
+                        )?;
+                        state.next_draw = Instant::now();
+                        println!("Bench frame fully refreshed; mode and run state preserved.");
+                    }
+                },
                 Ok(CommandResult::DisplayTest) => {
                     push_display_test(&mut epd, &mut delay, &mut frame)?;
                     thread::sleep(Duration::from_secs(2));
                     push_full_display(&mut epd, &mut delay, &mut frame, &settings, &weather)?;
-                    partial_refreshes = 0;
-                    if let Some(now) = valid_local_now() {
-                        last_minute = now.minute();
-                        last_ordinal = now.ordinal();
-                    }
                 }
                 Ok(CommandResult::EnterBench) => {
                     frame.render_bench_base(&settings.refresh_test);
@@ -316,12 +341,6 @@ fn main() -> Result<()> {
                 }
                 Ok(CommandResult::Clock) => {
                     app_mode = AppMode::Clock;
-                    push_full_display(&mut epd, &mut delay, &mut frame, &settings, &weather)?;
-                    partial_refreshes = 0;
-                    if let Some(now) = valid_local_now() {
-                        last_minute = now.minute();
-                        last_ordinal = now.ordinal();
-                    }
                     println!("Clock mode active.");
                 }
                 Ok(CommandResult::Reboot) => unsafe { sys::esp_restart() },
@@ -330,6 +349,26 @@ fn main() -> Result<()> {
             }
         }
 
+        let connected = wifi.is_connected().unwrap_or(false);
+        if !connected && weather.valid && !weather.stale {
+            weather.stale = true;
+            clock_dirty = true;
+        }
+        if matches!(&app_mode, AppMode::Clock)
+            && !settings.ssid.is_empty()
+            && !connected
+            && last_wifi_attempt.elapsed() >= Duration::from_secs(30)
+        {
+            last_wifi_attempt = Instant::now();
+            match connect_wifi(&mut wifi, &settings) {
+                Ok(()) => {
+                    drop(sntp.take());
+                    sntp = Some(EspSntp::new_default()?);
+                    clock_dirty = true;
+                }
+                Err(error) => println!("Wi-Fi reconnect failed: {error:#}"),
+            }
+        }
         let weather_due = !settings.ssid.is_empty()
             && last_weather_attempt.elapsed()
                 >= Duration::from_secs(settings.weather_minutes as u64 * 60);
@@ -341,57 +380,77 @@ fn main() -> Result<()> {
             match weather::fetch(&settings) {
                 Ok(update) => {
                     weather = update;
+                    clock_dirty = true;
                     println!("Weather updated.");
-                    if matches!(&app_mode, AppMode::Clock) {
-                        push_full_display(&mut epd, &mut delay, &mut frame, &settings, &weather)?;
-                        partial_refreshes = 0;
-                    }
-                    if let Some(now) = valid_local_now() {
-                        last_minute = now.minute();
-                        last_ordinal = now.ordinal();
-                    }
                 }
-                Err(error) => println!("Weather update failed: {error:#}"),
+                Err(error) => {
+                    weather.stale = true;
+                    clock_dirty = true;
+                    println!(
+                        "Weather update failed: {error:#}; preserving last data, retry in 60s"
+                    );
+                    last_weather_attempt = Instant::now()
+                        - Duration::from_secs(settings.weather_minutes as u64 * 60 - 60);
+                }
             }
         }
-        if let Some(now) = valid_local_now() {
-            if !clock_was_valid {
-                println!(
-                    "Time synchronized: {} ({})",
-                    now.format("%Y-%m-%d %H:%M:%S"),
-                    settings.timezone
-                );
-                if matches!(&app_mode, AppMode::Clock) {
-                    push_full_display(&mut epd, &mut delay, &mut frame, &settings, &weather)?;
-                    partial_refreshes = 0;
-                }
-                last_minute = now.minute();
-                last_ordinal = now.ordinal();
-                clock_was_valid = true;
-            } else if matches!(&app_mode, AppMode::Clock) && now.minute() != last_minute {
-                last_minute = now.minute();
-                let full = now.ordinal() != last_ordinal || partial_refreshes >= FULL_REFRESH_AFTER;
-                if full {
-                    push_full_display(&mut epd, &mut delay, &mut frame, &settings, &weather)?;
-                    partial_refreshes = 0;
-                } else {
-                    push_clock_patch(&mut epd, &mut delay, &mut frame, &settings, &weather)?;
-                    partial_refreshes += 1;
-                }
-                last_ordinal = now.ordinal();
-            }
-        } else if wifi.is_connected().unwrap_or(false)
+        let now = valid_local_now();
+        if now.is_some() && !clock_was_valid {
+            println!(
+                "Time synchronized: {} ({})",
+                now.unwrap().format("%Y-%m-%d %H:%M:%S"),
+                settings.timezone
+            );
+            clock_dirty = true;
+            clock_was_valid = true;
+        }
+        if now.is_none()
+            && wifi.is_connected().unwrap_or(false)
             && last_sntp_restart.elapsed() >= SNTP_RETRY_AFTER
         {
-            let status = sntp
-                .as_ref()
-                .map(|service| service.get_sync_status())
-                .unwrap_or(SyncStatus::Reset);
-            println!("Time is still unsynchronized (SNTP {status:?}); restarting SNTP.");
+            println!("Time unsynchronized; restarting SNTP.");
             drop(sntp.take());
             sntp = Some(EspSntp::new_default()?);
             last_sntp_restart = Instant::now();
             clock_was_valid = false;
+        }
+        if matches!(&app_mode, AppMode::Clock) {
+            let minute = now.map(|n| n.and_utc().timestamp().div_euclid(60));
+            let cleanup =
+                now.and_then(|n| hourly_cleanup.observe(n.and_utc().timestamp().div_euclid(3600)));
+            if let Some(cleanup) = cleanup {
+                // Keep the physical old image until the new clock/date/weather target
+                // is rendered; each cleanup phase then synchronizes its actual state.
+                let previous = frame.bytes().to_vec();
+                frame.render(&settings, &weather, now);
+                println!(
+                    "LOCAL HOURLY CHIME: {:?} at {}",
+                    cleanup,
+                    now.unwrap().format("%Y-%m-%d %H:%M:%S")
+                );
+                fast_blank_then_display(
+                    &mut epd,
+                    &mut delay,
+                    &previous,
+                    frame.bytes(),
+                    cleanup == clock_policy::Cleanup::Scrub,
+                )?;
+                if cleanup == clock_policy::Cleanup::Scrub {
+                    six_hour_scrubs += 1;
+                } else {
+                    hourly_whites += 1;
+                }
+                last_cleanup =
+                    format!("{:?} {}", cleanup, now.unwrap().format("%Y-%m-%d %H:%M:%S"));
+                clock_dirty = false;
+                clock_minute = minute;
+            } else if clock_dirty || minute != clock_minute {
+                if push_clock_patch(&mut epd, &mut delay, &mut frame, &settings, &weather)? {
+                    clock_patches += 1;
+                }
+                clock_dirty = false;
+                clock_minute = minute;
+            }
         }
         if let AppMode::Bench(state) = &mut app_mode {
             bench_tick(
@@ -423,6 +482,7 @@ fn write_full_frame<B>(
     frame: &LandscapeFrame,
     mode: RefreshTestMode,
     prime: RefreshTestPrime,
+    post_full_fast: bool,
 ) -> Result<()>
 where
     Uc8253Controller: EpdController<B>,
@@ -465,6 +525,10 @@ where
         epd.write_frame(ColorChannel::RedYellow, frame.bytes())
             .map_err(|error| anyhow::anyhow!("full previous-plane prime: {error:?}"))?;
     }
+    if post_full_fast {
+        println!("Finishing full reset with fast blank/redraw to condition fine text.");
+        fast_blank_redraw(epd, delay, frame)?;
+    }
     select_full_window(epd)?;
     Ok(())
 }
@@ -487,6 +551,7 @@ where
         frame,
         RefreshTestMode::Fast,
         RefreshTestPrime::Old,
+        true,
     )?;
     println!("Display refreshed (fast full, GxEPD2 old-plane prime)");
     Ok(())
@@ -498,34 +563,32 @@ fn push_clock_patch<B>(
     frame: &mut LandscapeFrame,
     settings: &Settings,
     weather: &Weather,
-) -> Result<()>
+) -> Result<bool>
 where
     Uc8253Controller: EpdController<B>,
     <Uc8253Controller as EpdController<B>>::Error: core::fmt::Debug,
 {
+    let previous = frame.bytes().to_vec();
     frame.render(settings, weather, valid_local_now());
-    let patch = frame.native_window_bytes(
-        CLOCK_WINDOW_X_START as usize,
-        CLOCK_WINDOW_Y_START as usize,
-        CLOCK_WINDOW_X_END as usize,
-        CLOCK_WINDOW_Y_END as usize,
-    );
-    epd.set_window(
-        CLOCK_WINDOW_X_START,
-        CLOCK_WINDOW_Y_START,
-        CLOCK_WINDOW_X_END,
-        CLOCK_WINDOW_Y_END,
-    )
-    .map_err(|error| anyhow::anyhow!("display clock-window selection: {error:?}"))?;
+    let Some((x0, y0, x1, y1)) = clock_policy::dirty_window(&previous, frame.bytes()) else {
+        return Ok(false);
+    };
+    let patch = frame.native_window_bytes(x0 as usize, y0 as usize, x1 as usize, y1 as usize);
+    epd.set_window(x0, y0, x1, y1)
+        .map_err(|e| anyhow::anyhow!("clock dirty window: {e:?}"))?;
     epd.controller_mut()
         .set_refresh_mode(Uc8253RefreshMode::FastPartial);
+    let started = Instant::now();
     epd.display_frame(ColorChannel::BlackWhite, &patch, delay)
-        .map_err(|error| anyhow::anyhow!("display clock refresh: {error:?}"))?;
+        .map_err(|e| anyhow::anyhow!("clock fast redraw: {e:?}"))?;
     epd.write_frame(ColorChannel::RedYellow, &patch)
-        .map_err(|error| anyhow::anyhow!("display clock baseline write: {error:?}"))?;
-    select_full_window(epd)?;
-    println!("Display refreshed (clock patch)");
-    Ok(())
+        .map_err(|e| anyhow::anyhow!("clock baseline: {e:?}"))?;
+    println!(
+        "Clock content-aware fast window ({x0},{y0})..({x1},{y1}): {} bytes, {}ms",
+        patch.len(),
+        started.elapsed().as_millis()
+    );
+    Ok(true)
 }
 
 fn push_display_test<B>(
@@ -544,6 +607,7 @@ where
         frame,
         RefreshTestMode::Fast,
         RefreshTestPrime::Old,
+        true,
     )?;
     println!("Display test shown; restoring dashboard in 2 seconds.");
     Ok(())
@@ -559,7 +623,69 @@ where
     Uc8253Controller: EpdController<B>,
     <Uc8253Controller as EpdController<B>>::Error: core::fmt::Debug,
 {
-    write_full_frame(epd, delay, frame, config.full_mode, config.prime)
+    write_full_frame(
+        epd,
+        delay,
+        frame,
+        config.full_mode,
+        config.prime,
+        config.post_full_fast,
+    )
+}
+
+/// Experimental cleanup; retain the authoritative framebuffer throughout both
+/// waveforms and synchronize old RAM to each intermediate visible state.
+fn fast_blank_redraw<B>(
+    epd: &mut EpdDriver<B, Uc8253Controller, GDEY037T03>,
+    delay: &mut FreeRtos,
+    frame: &LandscapeFrame,
+) -> Result<()>
+where
+    Uc8253Controller: EpdController<B>,
+    <Uc8253Controller as EpdController<B>>::Error: core::fmt::Debug,
+{
+    fast_blank_then_display(epd, delay, frame.bytes(), frame.bytes(), false)
+}
+
+fn fast_blank_then_display<B>(
+    epd: &mut EpdDriver<B, Uc8253Controller, GDEY037T03>,
+    delay: &mut FreeRtos,
+    previous: &[u8],
+    desired: &[u8],
+    scrub: bool,
+) -> Result<()>
+where
+    Uc8253Controller: EpdController<B>,
+    <Uc8253Controller as EpdController<B>>::Error: core::fmt::Debug,
+{
+    let blank = vec![0xff; display::FRAME_BYTES];
+    let black = scrub.then(|| vec![0x00; display::FRAME_BYTES]);
+    epd.set_window(0, 0, 239, 415)
+        .map_err(|e| anyhow::anyhow!("fast cleanup window: {e:?}"))?;
+    epd.controller_mut()
+        .set_refresh_mode(Uc8253RefreshMode::FastPartial);
+    // This manual experiment assumes the framebuffer matches the visible state,
+    // even if a preceding bench probe intentionally disabled baseline sync.
+    epd.write_frame(ColorChannel::RedYellow, previous)
+        .map_err(|e| anyhow::anyhow!("fast cleanup initial baseline: {e:?}"))?;
+    let mut phases = vec![("white", blank.as_slice())];
+    if let Some(black) = &black {
+        phases.push(("black", black.as_slice()));
+        phases.push(("white", blank.as_slice()));
+    }
+    phases.push(("redraw", desired));
+    for (label, bytes) in phases {
+        let started = Instant::now();
+        epd.display_frame(ColorChannel::BlackWhite, bytes, delay)
+            .map_err(|e| anyhow::anyhow!("fast cleanup {label}: {e:?}"))?;
+        epd.write_frame(ColorChannel::RedYellow, bytes)
+            .map_err(|e| anyhow::anyhow!("fast cleanup {label} baseline: {e:?}"))?;
+        println!(
+            "refresh fast {label}: {}ms (whole screen, old-plane synchronized)",
+            started.elapsed().as_millis()
+        );
+    }
+    Ok(())
 }
 
 fn bench_tick<B>(
@@ -588,28 +714,75 @@ where
 
     let rect = bench_rectangle(config, state.draws);
     let (x0, y0, x1, y1) = native_bench_window(rect);
-    let sequence_len = match config.glyphs {
-        RefreshTestGlyphs::Digits => 10_u16,
-        RefreshTestGlyphs::All => 94_u16,
-        RefreshTestGlyphs::Shapes => 6,
-        RefreshTestGlyphs::Shades => 17,
-        RefreshTestGlyphs::Mixed => 376,
+    let sequence_len = if config.region == RefreshTestRegion::Patterns {
+        bench_geometry::PATTERN_DRAWS
+    } else if config.region == RefreshTestRegion::TextPage {
+        94
+    } else if config.region == RefreshTestRegion::Grid {
+        if config.grid_update == GridUpdate::Cell {
+            564
+        } else {
+            94
+        }
+    } else {
+        match config.glyphs {
+            RefreshTestGlyphs::Digits => 10_u16,
+            RefreshTestGlyphs::All => 94_u16,
+            RefreshTestGlyphs::Shapes => 6,
+            RefreshTestGlyphs::Shades => 17,
+            RefreshTestGlyphs::Mixed => 376,
+            RefreshTestGlyphs::Text => 8,
+        }
     };
     if state.item == 0 {
         println!("RT cycle {}", state.cycle + 1);
     }
-    if config.region == RefreshTestRegion::Preset && config.glyphs == RefreshTestGlyphs::Digits {
-        frame.render_refresh_test_patch(state.item as u8, config.size == RefreshTestSize::Large);
-    } else if config.region == RefreshTestRegion::Preset && config.glyphs == RefreshTestGlyphs::All
-    {
-        frame.render_refresh_test_ascii(
-            char::from_u32(33 + state.item as u32).unwrap(),
-            config.size == RefreshTestSize::Large,
+    let label;
+    // Preserve the *previous* visible image before drawing a new target. Seeding
+    // old RAM with the new image before blanking would invalidate this A/B test.
+    let previous = config.blank_before.then(|| frame.bytes().to_vec());
+    if config.region == RefreshTestRegion::Patterns {
+        let (pattern, name) = bench_geometry::pattern_stage(state.item);
+        frame.render_pattern(pattern);
+        label = format!("patterns: {name}");
+    } else if config.region == RefreshTestRegion::TextPage {
+        frame.render_text_patch(config.size, state.draws, rect);
+        let (cw, ch) = display::text_cell_size(config.size);
+        label = format!(
+            "text row {} col {} count {}",
+            rect.top_left.y as u32 / ch,
+            rect.top_left.x as u32 / cw,
+            rect.size.width / cw
         );
+    } else if config.region == RefreshTestRegion::Grid {
+        if config.grid_update == GridUpdate::Cell {
+            let cell = (state.item % 6) as usize;
+            let step = state.item / 6 + 1;
+            frame.render_grid_cell(config, cell, step);
+            label = format!("grid cell {} step {}", cell + 1, step);
+        } else {
+            for cell in 0..6 {
+                frame.render_grid_cell(config, cell, state.item + 1);
+            }
+            label = format!("grid ALL cells step {}", state.item + 1);
+        }
     } else {
-        frame.render_bench_patch(config, state.item, rect);
+        if config.region == RefreshTestRegion::Preset && config.glyphs == RefreshTestGlyphs::Digits
+        {
+            frame
+                .render_refresh_test_patch(state.item as u8, config.size == RefreshTestSize::Large);
+        } else if config.region == RefreshTestRegion::Preset
+            && config.glyphs == RefreshTestGlyphs::All
+        {
+            frame.render_refresh_test_ascii(
+                char::from_u32(33 + state.item as u32).unwrap(),
+                config.size == RefreshTestSize::Large,
+            );
+        } else {
+            frame.render_bench_patch(config, state.item, rect);
+        }
+        label = format!("{:?}/{}", config.glyphs, state.item);
     }
-    let label = format!("{:?}/{}", config.glyphs, state.item);
     println!(
         "  logical ({},{}) {}x{}; native ({},{})..({},{}), {} pixels ({:.1}%)",
         rect.top_left.x,
@@ -628,6 +801,12 @@ where
     if config.full_every != 0 && state.draws % config.full_every as u32 == 0 {
         println!("  draw {}: '{}' (full cleanup)", state.draws, label);
         refresh_test_full_frame(epd, delay, frame, config)?;
+    } else if let Some(previous) = previous {
+        println!(
+            "  draw {}: '{}' (fast blank-before, WHOLE screen)",
+            state.draws, label
+        );
+        fast_blank_then_display(epd, delay, &previous, frame.bytes(), config.scrub_before)?;
     } else {
         println!("  draw {}: '{}'", state.draws, label);
         let patch = frame.native_window_bytes(x0 as usize, y0 as usize, x1 as usize, y1 as usize);
@@ -733,6 +912,8 @@ fn spawn_serial_reader() -> mpsc::Receiver<String> {
 }
 
 enum CommandResult {
+    RefreshScrub,
+    RefreshFast,
     None,
     Refresh,
     DisplayTest,
@@ -761,7 +942,7 @@ fn handle_command(
     match lower.as_str() {
         "help" | "?" => print_help(),
         "show" => print_settings(settings),
-        "status" => {
+        "status" | "clock stats" => {
             let wifi_connected = wifi.is_connected()?;
             let weather_status = if weather.valid {
                 "valid"
@@ -801,11 +982,29 @@ fn handle_command(
         "weather" => {
             *weather = weather::fetch(settings)?;
             println!("Weather updated.");
-            return Ok(CommandResult::Refresh);
         }
         "refresh" => return Ok(CommandResult::Refresh),
+        "refresh fast" => return Ok(CommandResult::RefreshFast),
+        "refresh scrub" => return Ok(CommandResult::RefreshScrub),
         "display test" => return Ok(CommandResult::DisplayTest),
         "refresh test" | "rt" => return Ok(CommandResult::EnterBench),
+        "rt grid" => {
+            settings.refresh_test.region = RefreshTestRegion::Grid;
+            print_refresh_test_settings(&settings.refresh_test);
+            return Ok(CommandResult::EnterBench);
+        }
+        "rt text" | "rt patterns" => {
+            settings.refresh_test.region = if lower == "rt text" {
+                RefreshTestRegion::TextPage
+            } else {
+                RefreshTestRegion::Patterns
+            };
+            settings.refresh_test.mode = RefreshTestMode::Fast;
+            settings.refresh_test.sync_baseline = true;
+            settings.refresh_test.full_every = 0;
+            print_refresh_test_settings(&settings.refresh_test);
+            return Ok(CommandResult::EnterBench);
+        }
         "run" | "rt run" => return Ok(CommandResult::BenchRun),
         "stop" | "rt stop" => return Ok(CommandResult::BenchStop),
         "clock" => return Ok(CommandResult::Clock),
@@ -876,7 +1075,10 @@ fn apply_test_preset(stage: u8, config: &mut RefreshTestSettings) {
 }
 
 const RT_MENU: &[(&str, &str)] = &[
-    ("region", "preset | custom | sweep | random"),
+    (
+        "region",
+        "preset | custom | sweep | random | grid | textpage | patterns",
+    ),
     (
         "rect",
         "x y width height (landscape 416x240; selects custom)",
@@ -887,7 +1089,7 @@ const RT_MENU: &[(&str, &str)] = &[
     ("height", "1..240"),
     (
         "content",
-        "digits | all (ASCII) | shapes | shades (dither) | mixed",
+        "digits | all (ASCII) | text | shapes | shades (dither) | mixed; grid uses fixed roles",
     ),
     ("size", "large | small"),
     ("time", "0..60 seconds AFTER each refresh"),
@@ -897,6 +1099,22 @@ const RT_MENU: &[(&str, &str)] = &[
     ("full_every", "draw count; 0 or off disables cleanup"),
     ("full_mode", "fast | normal"),
     ("prime", "old | both | none"),
+    (
+        "grid_update",
+        "cell (one at a time) | screen (all cells, one full-screen update)",
+    ),
+    (
+        "text_chars",
+        "1..69 characters per text-page patch; clamped to row width",
+    ),
+    (
+        "blank",
+        "off | on (white) | scrub (white/black/white), before each target; always synced",
+    ),
+    (
+        "post_full",
+        "on | off: fast blank/redraw after full reset (default on)",
+    ),
 ];
 
 fn print_rt_menu() {
@@ -908,6 +1126,21 @@ fn print_rt_menu() {
 }
 
 fn bench_rectangle(config: &RefreshTestSettings, draw: u32) -> Rectangle {
+    if config.region == RefreshTestRegion::Patterns {
+        return Rectangle::new(Point::zero(), Size::new(416, 240));
+    }
+    if config.region == RefreshTestRegion::TextPage {
+        let (cw, ch) = display::text_cell_size(config.size);
+        let (x, y, w, h) = bench_geometry::text_patch(cw, ch, config.text_chars, draw);
+        return Rectangle::new(Point::new(x as i32, y as i32), Size::new(w, h));
+    }
+    if config.region == RefreshTestRegion::Grid {
+        if config.grid_update == GridUpdate::Screen {
+            return Rectangle::new(Point::zero(), Size::new(416, 240));
+        }
+        let (x, y, w, h) = bench_geometry::GRID_CELLS[(draw % 6) as usize];
+        return Rectangle::new(Point::new(x as i32, y as i32), Size::new(w, h));
+    }
     if config.region == RefreshTestRegion::Preset {
         return if config.size == RefreshTestSize::Large {
             Rectangle::new(Point::new(8, 24), Size::new(192, 200))
@@ -1001,7 +1234,8 @@ fn apply_refresh_test_set(input: &str, settings: &mut Settings) -> Result<()> {
             "shapes" => config.glyphs = RefreshTestGlyphs::Shapes,
             "shades" => config.glyphs = RefreshTestGlyphs::Shades,
             "mixed" => config.glyphs = RefreshTestGlyphs::Mixed,
-            _ => anyhow::bail!("content must be digits, all, shapes, shades, or mixed"),
+            "text" => config.glyphs = RefreshTestGlyphs::Text,
+            _ => anyhow::bail!("content must be digits, all, text, shapes, shades, or mixed"),
         },
         "region" => {
             config.region = match value.as_str() {
@@ -1009,8 +1243,42 @@ fn apply_refresh_test_set(input: &str, settings: &mut Settings) -> Result<()> {
                 "custom" => RefreshTestRegion::Custom,
                 "sweep" => RefreshTestRegion::Sweep,
                 "random" => RefreshTestRegion::Random,
-                _ => anyhow::bail!("region must be preset, custom, sweep, or random"),
+                "grid" => RefreshTestRegion::Grid,
+                "textpage" | "text" => RefreshTestRegion::TextPage,
+                "patterns" => RefreshTestRegion::Patterns,
+                _ => anyhow::bail!(
+                    "region must be preset, custom, sweep, random, grid, textpage, or patterns"
+                ),
             }
+        }
+        "grid_update" => {
+            config.grid_update = match value.as_str() {
+                "cell" => GridUpdate::Cell,
+                "screen" | "all" => GridUpdate::Screen,
+                _ => anyhow::bail!("grid_update must be cell or screen"),
+            }
+        }
+        "text_chars" => {
+            let count: u16 = value.parse()?;
+            anyhow::ensure!((1..=69).contains(&count), "text_chars must be 1..69");
+            config.text_chars = count;
+        }
+        "blank" => {
+            let (enabled, scrub) = match value.as_str() {
+                "on" | "1" | "true" => (true, false),
+                "off" | "0" | "false" => (false, false),
+                "scrub" => (true, true),
+                _ => anyhow::bail!("blank must be off, on, or scrub"),
+            };
+            config.blank_before = enabled;
+            config.scrub_before = scrub;
+        }
+        "post_full" => {
+            config.post_full_fast = match value.as_str() {
+                "on" | "1" | "true" => true,
+                "off" | "0" | "false" => false,
+                _ => anyhow::bail!("post_full must be on or off"),
+            };
         }
         "x" => config.x = value.parse()?,
         "y" => config.y = value.parse()?,
@@ -1059,6 +1327,15 @@ fn apply_refresh_test_set(input: &str, settings: &mut Settings) -> Result<()> {
 }
 
 fn print_refresh_test_settings(config: &RefreshTestSettings) {
+    println!(
+        "RT post_full={}, scrub-before={}",
+        config.post_full_fast, config.scrub_before
+    );
+    println!(
+        "RT text_chars={}, blank-before={} (on forces full-screen fast waveforms + sync)",
+        config.text_chars, config.blank_before
+    );
+    println!("RT grid_update={:?} (grid roles: digit, text, shapes, shades, small text, density transitions)",config.grid_update);
     println!(
         "RT region={:?}, rect={} {} {} {}, content={:?}",
         config.region, config.x, config.y, config.width, config.height, config.glyphs
@@ -1217,6 +1494,7 @@ fn print_help() {
     println!(
         r#"Commands:
   help | show | status
+  clock stats                 soak counters, uptime, last cleanup, free heap
   set ssid <value>              set password <value>
   set latitude <-90..90>        set longitude <-180..180>
   set location <value>          set timezone <POSIX TZ>
@@ -1228,13 +1506,22 @@ fn print_help() {
   stop | rt stop              pause testing; retain bench mode and image
   clock                       return to clock demo mode
   refresh                     full redraw of current mode/image
+  refresh fast                experimental whole-screen fast blank + redraw
+  rt grid                     run the six-cell fixed-grid bench
+  rt text                     packed text page with character-precise replacements
+  rt patterns                 14 full-screen targets, no repeated-frame pass
+  rt set text_chars <1..69>    characters per text-page update
+  rt set blank <off|on|scrub>  direct vs white vs white/black/white cleanup
+  refresh scrub               fast white/black/white cleanup, restore framebuffer
+  rt set post_full <on|off>    fast conditioning after full reset
+  rt set grid_update <cell|screen>  one cell vs whole grid in one update
   rt <1..6> | rt all           fixed preset or all six presets
   rt show | rt save | rt defaults
   rt set                      numbered settings menu (pauses bench)
-  rt set region <preset|custom|sweep|random>
+  rt set region <preset|custom|sweep|random|grid>
   rt set rect <x y w h>        custom rectangle in landscape 416x240
   rt set x/y/width/height <n>  adjust region geometry
-  rt set content <digits|all|shapes|shades|mixed>
+  rt set content <digits|all|text|shapes|shades|mixed>
   rt set time <0..60>          seconds between draws
   rt set size <large|small>    rt set mode <fast|normal>
   rt set sync <on|off>         update previous-image plane after each draw

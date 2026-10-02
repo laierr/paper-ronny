@@ -13,6 +13,8 @@ pub struct Weather {
     pub humidity: f64,
     pub wind: f64,
     pub code: u16,
+    pub is_day: bool,
+    pub stale: bool,
 }
 
 #[derive(Deserialize)]
@@ -27,12 +29,14 @@ struct Current {
     relative_humidity_2m: f64,
     wind_speed_10m: f64,
     weather_code: u16,
+    is_day: u8,
 }
 
 pub fn description(code: u16) -> &'static str {
     match code {
         0 => "Clear",
-        1..=3 => "Partly cloudy",
+        1 | 2 => "Partly cloudy",
+        3 => "Overcast",
         45 | 48 => "Fog",
         51..=57 => "Drizzle",
         61..=67 => "Rain",
@@ -49,7 +53,7 @@ pub fn fetch(settings: &Settings) -> Result<Weather> {
     let longitude = settings.longitude.context("longitude is not configured")?;
     let mut url = format!(
         "https://api.open-meteo.com/v1/forecast?latitude={latitude:.5}&longitude={longitude:.5}\
-         &current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m\
+         &current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day\
          &timezone=auto"
     );
     url.retain(|character| !character.is_whitespace());
@@ -87,5 +91,7 @@ pub fn fetch(settings: &Settings) -> Result<Weather> {
         humidity: api.current.relative_humidity_2m,
         wind: api.current.wind_speed_10m,
         code: api.current.weather_code,
+        is_day: api.current.is_day != 0,
+        stale: false,
     })
 }

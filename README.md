@@ -10,6 +10,59 @@ The two versions use the same wiring, serial command vocabulary, NVS settings,
 and weather provider. Their display implementations remain side by side for
 comparison.
 
+## Daily-use Rust clock / multi-day soak
+
+Clock mode is the boot default. Routine minute, date, weather, and configuration
+updates use FastPartial plus old-image synchronization. A byte-level framebuffer
+diff selects the smallest enclosing native window; unchanged pixels/bytes are
+retained, and identical frames do not trigger a waveform. Returning from the
+bench is also a fast content-aware redraw.
+
+The cleanup schedule follows **local calendar time**, using the configured TZ:
+
+- At each new local hour: fast white blank → current dashboard.
+- At 00:00, 06:00, 12:00, 18:00: fast white → black → white → dashboard instead.
+- No periodic full waveform by patch count, weather fetch, or midnight change.
+  Full refresh is reserved for boot/unknown-state recovery, explicit `refresh`,
+  and bench baseline setup. Full recovery retains the proven post-full fast
+  blank/redraw conditioning for fine text.
+
+The first valid time arms the hour schedule without an immediate chime. Delayed
+hour detection (e.g. a weather request) runs the current hour's cleanup once,
+not a backlog. Backward/repeated DST hours don't double-fire. No audio hardware
+is configured: "chime" here means the screen's local-hour cleanup sequence.
+
+The redesigned 416×240 landscape page has a large 112-pixel-tall clock, centered
+date, separator, and aligned icon/temperature/conditions row. Weather Icons by
+Erik Flowers/Lukas Bischoff are embedded as 64×64 monochrome bitmaps under SIL
+OFL 1.1; source, license and regeneration instructions are in
+`assets/weather-icons/`. Weather conditions determine the icon, including a moon
+for clear night. No city name or unsynchronized 1970 date is displayed.
+
+Wi-Fi reconnects are retried, failed weather fetches retry after 60 seconds, and
+last-known data are retained with a `(stale)` label. HTTPS uses ESP-IDF's root
+certificate bundle. Weather retry timing uses uptime, but screen cleanup timing
+does not. Serial commands remain available between waveform/network operations.
+
+For the soak, leave USB power connected in `clock` mode. `status` or `clock stats`
+reports uptime, automatic patch count, hourly-white/six-hour-scrub counts, last
+cleanup and free heap. Counters are in RAM and reset on reboot; logs name every
+scheduled cleanup. The firmware runs autonomously with the serial monitor closed.
+This is the start of the multi-day test, not evidence that artifacts cannot
+accumulate. Avoid bench/manual refresh commands during the soak if you want an
+uninterrupted view of the production policy.
+
+Host preview and tests (no ESP-IDF required):
+
+```powershell
+cargo +stable run --manifest-path scripts/clock-preview/Cargo.toml --target x86_64-pc-windows-msvc --target-dir target/clock-preview-host
+cargo +stable test --manifest-path scripts/clock-preview/Cargo.toml --target x86_64-pc-windows-msvc --target-dir target/clock-preview-host
+```
+
+The preview renders actual display code to `target/clock-preview.pbm` and verifies
+minute changes preserve date/weather, and single-character updates preserve all
+neighboring pixels. Unit tests cover dirty windows and local cleanup boundaries.
+
 ## Rust build (primary)
 
 The Rust build uses ESP-IDF and the `esp-idf-sys` PlatformIO backend. The
@@ -198,11 +251,122 @@ target/bench-geometry-tests.exe
 
 ## Notes
 
-- Weather requests use Open-Meteo and need no API key. This demo disables TLS
-  certificate validation to avoid maintaining a root CA on the device; add CA
-  validation before using the networking code in a security-sensitive product.
-- The Rust clock uses a byte-aligned hardware window for minute updates. It
-  performs a full cleanup after 10 clock patches and whenever date, weather, or
-  configuration content changes.
+### Fixed-grid refresh bench (Rust)
+
+`rt grid` starts a fixed six-cell mosaic. Unlike random tests, each cell retains
+its location and has its own sequence, with different window aspect ratios:
+
+| Cell | Landscape rectangle (x y width height) | Content |
+|---|---|---|
+| 1 | 4 4 128 232 | Large seven-segment digit |
+| 2 | 136 4 276 44 | Changing large-font text strings |
+| 3 | 136 52 132 132 | Filled/outlined geometry |
+| 4 | 272 52 140 132 | Dither coverage 0..100% black |
+| 5 | 136 188 132 48 | Changing small-font text strings |
+| 6 | 272 188 140 48 | Solid black → sparse text → white → text |
+
+The cell windows are rectangular (controller requirement); artwork includes
+circles, triangles and other shapes. Byte-rounded gutter pixels are preserved.
+Grid mode uses these fixed content roles rather than the global `content` and
+`size` settings. Initial content is drawn during baseline setup; subsequent
+updates start with step 1. A cycle is 94 rounds: 564 cell updates, or 94
+whole-screen updates. `cycles forever` repeats indefinitely.
+
+```text
+rt set mode fast
+rt set sync on
+rt set full_every off
+rt set time 1
+rt set cycles forever
+rt set grid_update cell
+rt grid
+```
+
+`grid_update cell` updates one cell per draw, round-robin. For the whole-screen
+experiment, stop and switch to `rt set grid_update screen`, then `run`:
+all six cells advance together and the entire framebuffer is sent in one
+partial waveform. With `mode fast`, this is **FastPartial over the whole
+screen**, not the flashing FastFull waveform. Menu item 16 selects this option.
+Changing bench settings resets the baseline on the next run, using a full
+waveform; `full_every off` disables periodic full cleanup after that.
+
+Outside grid mode, `rt set content text` tests strings in any arbitrary region;
+`size` selects 10x20 or 6x10 font pixels.
+
+### Experimental fast cleanup
+
+`refresh fast` works in either clock or bench mode, running two full-screen
+**FastPartial** waveforms: blank white, synchronize the blank previous-image
+plane, then restore the complete saved framebuffer and synchronize it again.
+It preserves the framebuffer, bench sequence, and running/paused state, and
+logs the duration of both phases. This probes whether an intermediate white
+image reduces black-to-white residue without a full waveform. It is not a
+recovery operation for an unknown/corrupted physical state: it assumes the
+framebuffer matches the visible image. Plain `refresh` retains the full-waveform
+recovery path. This experiment does not change the clock demo's refresh policy.
+
+### Packed text and full-screen pattern tests
+
+`rt text` fills the screen with readable monospace text, then replaces small
+character spans on different rows. `rt set size small` uses 69 columns × 24 rows
+of 6×10 cells; `large` uses 41 columns × 12 rows of 10×20 cells. Only the selected
+cells are erased and rewritten. Controller byte rounding preserves neighboring
+characters and spacing. `rt set text_chars 1` exercises single-character writes;
+the default is 8 characters. Counts longer than a row are clamped to its width.
+Rows/columns are zero-based in serial logs; unfilled right-edge pixels remain
+white. This is a separate page bench, not the old single-string tile test.
+
+`rt patterns` selects fast/synced full-screen updates and disables periodic full
+cleanup. Its first eight targets are: vertical lines → horizontal lines → grid
+→ black → white grid on black → invert → invert → solid white. Extra stages
+probe 50% dither → black → white, then sparse shapes → black → white.
+Each cycle has 14 draws. The repeated-frame pass was removed after panel testing
+showed little benefit. Lines have 16-pixel pitch; inversion stages use fixed
+target images. Logs name each target.
+
+For a direct-vs-blanking comparison:
+
+```text
+rt set time 1
+rt set cycles 1
+rt set blank off
+rt patterns
+rt set blank on
+rt patterns
+rt set blank scrub
+rt patterns
+```
+
+`blank on` uses fast whole-screen white blanking plus a fast whole-screen target
+redraw for every step, syncing both intermediate states. The old baseline comes
+from the framebuffer **before** rendering the next target. This option overrides
+the partial `mode` and `sync` probes; even a tiny text patch then causes two
+whole-screen waveforms, while retaining all untouched framebuffer pixels. With
+`blank off`, normal configured window/mode/sync behavior applies. A nonzero
+`full_every` still takes precedence, so keep it off for this comparison.
+Menu items 17 and 18 control `text_chars` and `blank` respectively. `rt text` and
+`rt patterns` preserve the selected blank option, gap and cycle count. Entry or
+configuration restart still establishes a full baseline; subsequent
+cycles do not reset unless explicitly configured. Physical ghosting must be
+assessed on the panel; waveform completion alone is not a quality verdict.
+
+`rt set blank scrub` performs fast white → black → white → target for every draw,
+synchronizing the previous-image RAM after each phase. This costs four waveforms
+but tests the cleanup found more effective on the physical panel. `refresh scrub`
+runs it once and restores the current framebuffer without advancing the bench.
+Both manual cleanup commands preserve run/pause state. `blank on` retains the
+two-waveform white → target method; `blank off` uses direct redraw.
+
+Full refreshes now finish with fast white blanking and restoration by default:
+this applies the user's observed workaround for faint fine text after full
+reset. The underlying physical/controller cause is not yet proven. Bench menu
+item 19 (`rt set post_full off`) disables this conditioning for A/B diagnosis;
+it also allows the old `prime` probes to be tested without subsequent automatic
+old-plane synchronization. Clock/demo full refreshes always condition the image.
+
+- Weather requests use Open-Meteo and need no API key. Rust HTTPS validates the
+  server using ESP-IDF's certificate bundle.
+- The Rust clock uses content-aware byte-aligned hardware windows, with local
+  hourly fast cleanup and six-hour fast scrub as described above.
 - If the module is a different 3.7-inch revision, confirm the panel marking.
   This project specifically selects `GxEPD2_370_GDEY037T03`.
