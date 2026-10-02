@@ -15,11 +15,20 @@ pub struct Weather {
     pub code: u16,
     pub is_day: bool,
     pub stale: bool,
+    pub moon_phases: Vec<(chrono::NaiveDate, f64)>,
 }
 
 #[derive(Deserialize)]
 struct ApiResponse {
     current: Current,
+    #[serde(default)]
+    daily: Option<Daily>,
+}
+
+#[derive(Deserialize)]
+struct Daily {
+    time: Vec<String>,
+    moon_phase: Vec<Option<f64>>,
 }
 
 #[derive(Deserialize)]
@@ -54,7 +63,7 @@ pub fn fetch(settings: &Settings) -> Result<Weather> {
     let mut url = format!(
         "https://api.open-meteo.com/v1/forecast?latitude={latitude:.5}&longitude={longitude:.5}\
          &current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day\
-         &timezone=auto"
+         &daily=moon_phase&forecast_days=2&timezone=auto"
     );
     url.retain(|character| !character.is_whitespace());
     if !settings.metric {
@@ -93,5 +102,21 @@ pub fn fetch(settings: &Settings) -> Result<Weather> {
         code: api.current.weather_code,
         is_day: api.current.is_day != 0,
         stale: false,
+        moon_phases: api
+            .daily
+            .into_iter()
+            .flat_map(|daily| {
+                daily
+                    .time
+                    .into_iter()
+                    .zip(daily.moon_phase)
+                    .filter_map(|(day, phase)| {
+                        let day = chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d").ok()?;
+                        let phase = phase?;
+                        crate::moon_phase::phase_index(phase)?;
+                        Some((day, phase))
+                    })
+            })
+            .collect(),
     })
 }

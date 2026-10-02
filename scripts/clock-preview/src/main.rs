@@ -7,16 +7,17 @@ mod config {
     pub struct Settings { pub metric: bool }
 }
 mod weather {
-    pub struct Weather { pub valid: bool, pub temperature: f64, pub apparent: f64, pub humidity: f64, pub wind: f64, pub code: u16, pub is_day: bool, pub stale: bool }
+    pub struct Weather { pub valid: bool, pub temperature: f64, pub apparent: f64, pub humidity: f64, pub wind: f64, pub code: u16, pub is_day: bool, pub stale: bool, pub moon_phases: Vec<(chrono::NaiveDate, f64)> }
     pub fn description(_: u16) -> &'static str { "Partly cloudy" }
 }
 #[path = "../../../src/display.rs"] mod display;
 #[path = "../../../src/bench_geometry.rs"] mod bench_geometry;
 #[path = "../../../src/clock_policy.rs"] mod clock_policy;
+#[path = "../../../src/moon_phase.rs"] mod moon_phase;
 
 fn main() {
     let settings = config::Settings { metric: true };
-    let weather = weather::Weather { valid: true, temperature: 27., apparent: 29., humidity: 63., wind: 12., code: 2, is_day: true, stale: false };
+    let weather = weather::Weather { valid: true, temperature: 27., apparent: 29., humidity: 63., wind: 12., code: 2, is_day: true, stale: false, moon_phases: vec![(chrono::NaiveDate::from_ymd_opt(2026,10,2).unwrap(), 0.706)] };
     let mut frame = display::LandscapeFrame::new();
     let time = chrono::NaiveDate::from_ymd_opt(2026,10,2).unwrap().and_hms_opt(12,34,0).unwrap();
     frame.render(&settings,&weather,Some(time));

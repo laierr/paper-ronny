@@ -1,14 +1,19 @@
 # Paper Ronny
 
+Project code is [MIT licensed](LICENSE). Fonts, vendored code, dependencies,
+and weather data retain their own licenses; see [third-party notices](THIRD_PARTY.md).
+
 This repository contains two implementations side by side:
 
 - [`src/main.rs`](src/main.rs) is the primary Rust/ESP-IDF implementation.
 - [`src/main.cpp`](src/main.cpp) is the original Arduino/C++ implementation,
   retained as a working reference for comparison.
 
-The two versions use the same wiring, serial command vocabulary, NVS settings,
-and weather provider. Their display implementations remain side by side for
-comparison.
+The two versions use the same wiring, basic serial command vocabulary, and
+weather provider. Settings are stored separately in ESP32 NVS (`paper_ronny`
+for Rust, `paper-ronny` for C++); configure each version independently. Their
+display implementations remain side by side for comparison. The advanced
+refresh bench and cleanup schedule described below are Rust-only.
 
 ## Daily-use Rust clock / multi-day soak
 
@@ -33,11 +38,19 @@ not a backlog. Backward/repeated DST hours don't double-fire. No audio hardware
 is configured: "chime" here means the screen's local-hour cleanup sequence.
 
 The redesigned 416×240 landscape page has a large 112-pixel-tall clock, centered
-date, separator, and aligned icon/temperature/conditions row. Weather Icons by
+date, separator, and one aligned weather-symbol row: temperature + Celsius or
+Fahrenheit glyph, condition glyph, humidity glyph + value (no extra percent
+sign), and moon-phase glyph. Weather Icons by
 Erik Flowers/Lukas Bischoff are embedded as 64×64 monochrome bitmaps under SIL
 OFL 1.1; source, license and regeneration instructions are in
 `assets/weather-icons/`. Weather conditions determine the icon, including a moon
 for clear night. No city name or unsynchronized 1970 date is displayed.
+The moon glyph uses Open-Meteo's `daily=moon_phase` fraction, mapped to the
+nearest of eight icons; no local astronomical approximation is used. Two days
+are cached so midnight can select the next day's value without waiting for a
+weather fetch. Missing/invalid phases or dates without data remain hidden,
+as does the moon until time is synchronized. Detailed condition, feels-like,
+and wind readings remain available through `status`, not on the compact row.
 
 Wi-Fi reconnects are retried, failed weather fetches retry after 60 seconds, and
 last-known data are retained with a `(stale)` label. HTTPS uses ESP-IDF's root
@@ -70,16 +83,26 @@ original ESP32-D0WD-V3 is an Xtensa target, so install the Espressif Rust
 toolchain first:
 
 ```powershell
-cargo install espup ldproxy
+cargo install espup ldproxy espflash
 espup install
-. $HOME\export-esp.ps1
+$env:LIBCLANG_PATH = "$env:USERPROFILE\.rustup\toolchains\esp\xtensa-esp32-elf-clang\esp-clang\bin"
 cargo build --release
 espflash flash --port COM14 --baud 921600 --monitor --monitor-baud 115200 target\xtensa-esp32-espidf\release\paper-ronny
 espflash monitor --port COM14
 ```
 
 The host also needs the C++ workload from Visual Studio Build Tools on Windows;
-`espup` and several Cargo build dependencies require Microsoft's linker.
+`espup` and several Cargo build dependencies require Microsoft's linker. The
+`LIBCLANG_PATH` example assumes the default Rust installation directory; adjust
+it if using a custom `RUSTUP_HOME`. Set it in each new PowerShell session.
+Replace `COM14` with your board's port (`espflash board-info` can detect it).
+Press Ctrl+R in the monitor if the board is still in the bootloader after flashing;
+Ctrl+C closes the monitor without stopping the running firmware.
+
+This build enables the PlatformIO backend internally through Cargo; you do not
+run `pio run` for Rust. A patched `esp-idf-sys` crate is vendored for compatibility
+with the PlatformIO metadata interface; see [third-party notices](THIRD_PARTY.md).
+This configuration has been exercised on Windows, not validated on every host.
 
 ## C++ reference build
 
@@ -112,17 +135,9 @@ Both the ESP32 and the WeAct module use **3.3 V logic**.
 
 These values match the executable definitions in WeAct's ESP32 example. Its
 nearby comment reverses D/C and reset, so follow the table above. Pins can be
-changed in `platformio.ini` without editing source code.
+changed in `platformio.ini` for C++; Rust pin assignments are in `src/main.rs`.
 
-## Build, flash, and monitor
-
-Install PlatformIO, connect the ESP32, then run:
-
-```sh
-pio run
-pio run -t upload
-pio device monitor
-```
+## Serial setup (both implementations)
 
 The serial port is 115200 baud with a newline line ending. Type `help` to list
 all commands. A first-time setup might look like:
@@ -303,7 +318,7 @@ logs the duration of both phases. This probes whether an intermediate white
 image reduces black-to-white residue without a full waveform. It is not a
 recovery operation for an unknown/corrupted physical state: it assumes the
 framebuffer matches the visible image. Plain `refresh` retains the full-waveform
-recovery path. This experiment does not change the clock demo's refresh policy.
+recovery path. Clock mode also uses this blank/redraw sequence for hourly cleanup.
 
 ### Packed text and full-screen pattern tests
 
@@ -366,6 +381,15 @@ old-plane synchronization. Clock/demo full refreshes always condition the image.
 
 - Weather requests use Open-Meteo and need no API key. Rust HTTPS validates the
   server using ESP-IDF's certificate bundle.
+- The retained C++ demo calls `setInsecure()` and does **not** authenticate the
+  weather server. Treat it as a reference/demo, not a secure production client.
+- Wi-Fi credentials are stored on the board in NVS, not in the repository.
+  NVS encryption is not enabled; serial access can change settings, and the
+  serial setup channel is not encrypted. Do not publish NVS dumps or serial
+  transcripts containing passwords.
+- Weather data: [Open-Meteo](https://open-meteo.com/), licensed under
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Review the provider's
+  [API terms](https://open-meteo.com/en/terms) before commercial deployment.
 - The Rust clock uses content-aware byte-aligned hardware windows, with local
   hourly fast cleanup and six-hour fast scrub as described above.
 - If the module is a different 3.7-inch revision, confirm the panel marking.

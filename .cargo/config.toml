@@ -12,4 +12,3 @@ build-std = ["std", "panic_abort"]
 MCU = "esp32"
 ESP_IDF_VERSION = "v5.3.3"
 ESP_IDF_PATH_ISSUES = "warn"
-LIBCLANG_PATH = "C:\\Users\\kende\\.rustup\\toolchains\\esp\\xtensa-esp32-elf-clang\\esp-clang\\bin"

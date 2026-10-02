@@ -16,7 +16,7 @@ use crate::{
     config::{
         RefreshTestGlyphs, RefreshTestRegion, RefreshTestSettings, RefreshTestSize, Settings,
     },
-    weather::{description, Weather},
+    weather::Weather,
 };
 
 pub const FRAME_BYTES: usize = 240 * 416 / 8;
@@ -107,62 +107,73 @@ impl LandscapeFrame {
                 95..=99 => include_bytes!("../assets/weather-icons/storm.bin"),
                 _ => include_bytes!("../assets/weather-icons/cloud.bin"),
             };
-            self.draw_iter((0..64).flat_map(|y| {
-                (0..64).map(move |x| {
-                    Pixel(
-                        Point::new(16 + x, 169 + y),
-                        if icon[(y * 8 + x / 8) as usize] & (1 << (7 - x % 8)) == 0 {
-                            BinaryColor::On
-                        } else {
-                            BinaryColor::Off
-                        },
-                    )
-                })
-            }))
-            .ok();
-            let unit = if settings.metric { "C" } else { "F" };
+            // Fixed, non-overlapping groups: temperature/unit, condition,
+            // humidity/value, then a decorative moon phase.
             let temperature = format!("{:.0}", weather.temperature);
-            draw_number(self, &temperature, Point::new(90, 175), 26, 44, 5, 5);
-            Text::with_text_style(
-                unit,
-                Point::new(90 + temperature.len() as i32 * 31, 197),
-                medium,
-                left,
-            )
-            .draw(self)
-            .ok();
-            Text::with_text_style(
-                description(weather.code),
-                Point::new(205, 173),
-                medium,
-                left,
-            )
-            .draw(self)
-            .ok();
-            Text::with_text_style(
-                &format!(
-                    "Feels {:.0} {}  RH {:.0}%",
-                    weather.apparent, unit, weather.humidity
-                ),
-                Point::new(205, 200),
-                small,
-                left,
-            )
-            .draw(self)
-            .ok();
-            Text::with_text_style(
-                &format!(
-                    "Wind {:.0} {}{}",
-                    weather.wind,
-                    if settings.metric { "km/h" } else { "mph" },
-                    if weather.stale { " (stale)" } else { "" }
-                ),
-                Point::new(205, 218),
-                small,
-                left,
-            )
-            .draw(self)
-            .ok();
+            let (digit_w, digit_h, thickness, gap) = if temperature.len() <= 3 {
+                (26, 44, 5, 5)
+            } else {
+                (20, 36, 4, 4)
+            };
+            draw_number(
+                self,
+                &temperature,
+                Point::new(16, 177),
+                digit_w,
+                digit_h,
+                thickness,
+                gap,
+            );
+            self.draw_weather_bitmap(
+                if settings.metric {
+                    include_bytes!("../assets/weather-icons/celsius.bin")
+                } else {
+                    include_bytes!("../assets/weather-icons/fahrenheit.bin")
+                },
+                Point::new(16 + temperature.len() as i32 * (digit_w as i32 + gap), 177),
+                40,
+            );
+            self.draw_weather_bitmap(icon, Point::new(152, 168), 64);
+            self.draw_weather_bitmap(
+                include_bytes!("../assets/weather-icons/humidity.bin"),
+                Point::new(226, 176),
+                48,
+            );
+            draw_number(
+                self,
+                &format!("{:.0}", weather.humidity.clamp(0.0, 100.0)),
+                Point::new(282, 181),
+                20,
+                36,
+                4,
+                4,
+            );
+            // Match the local calendar date, including the cached next day at midnight.
+            // Missing/invalid daily data stays hidden rather than inventing a phase.
+            if let Some(phase) = now.and_then(|now| {
+                weather
+                    .moon_phases
+                    .iter()
+                    .find(|(day, _)| *day == now.date())
+                    .and_then(|(_, fraction)| crate::moon_phase::phase_index(*fraction))
+            }) {
+                let phases: [&[u8; 512]; 8] = [
+                    include_bytes!("../assets/weather-icons/phase_new.bin"),
+                    include_bytes!("../assets/weather-icons/phase_waxing_crescent.bin"),
+                    include_bytes!("../assets/weather-icons/phase_first_quarter.bin"),
+                    include_bytes!("../assets/weather-icons/phase_waxing_gibbous.bin"),
+                    include_bytes!("../assets/weather-icons/phase_full.bin"),
+                    include_bytes!("../assets/weather-icons/phase_waning_gibbous.bin"),
+                    include_bytes!("../assets/weather-icons/phase_third_quarter.bin"),
+                    include_bytes!("../assets/weather-icons/phase_waning_crescent.bin"),
+                ];
+                self.draw_weather_bitmap(phases[phase], Point::new(364, 182), 36);
+            }
+            if weather.stale {
+                Text::with_text_style("STALE", Point::new(16, 228), small, left)
+                    .draw(self)
+                    .ok();
+            }
         } else {
             Text::with_text_style(
                 "Weather unavailable",
@@ -173,6 +184,23 @@ impl LandscapeFrame {
             .draw(self)
             .ok();
         }
+    }
+
+    fn draw_weather_bitmap(&mut self, bitmap: &[u8; 512], origin: Point, size: i32) {
+        self.draw_iter((0..size).flat_map(|y| {
+            (0..size).map(move |x| {
+                let (sx, sy) = (x * 64 / size, y * 64 / size);
+                Pixel(
+                    origin + Point::new(x, y),
+                    if bitmap[(sy * 8 + sx / 8) as usize] & (1 << (7 - sx % 8)) == 0 {
+                        BinaryColor::On
+                    } else {
+                        BinaryColor::Off
+                    },
+                )
+            })
+        }))
+        .ok();
     }
 
     pub fn render_test(&mut self) {

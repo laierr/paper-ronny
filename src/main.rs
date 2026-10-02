@@ -2,6 +2,7 @@ mod bench_geometry;
 mod clock_policy;
 mod config;
 mod display;
+mod moon_phase;
 mod weather;
 
 use std::{
@@ -943,6 +944,20 @@ fn handle_command(
         "help" | "?" => print_help(),
         "show" => print_settings(settings),
         "status" | "clock stats" => {
+            if weather.valid {
+                println!(
+                    "Weather: {}, {:.0} {}, feels {:.0}, RH {:.0}%, wind {:.0} {}, stale={}",
+                    weather::description(weather.code),
+                    weather.temperature,
+                    if settings.metric { "C" } else { "F" },
+                    weather.apparent,
+                    weather.humidity,
+                    weather.wind,
+                    if settings.metric { "km/h" } else { "mph" },
+                    weather.stale
+                );
+                println!("Open-Meteo daily moon phases: {:?}", weather.moon_phases);
+            }
             let wifi_connected = wifi.is_connected()?;
             let weather_status = if weather.valid {
                 "valid"
